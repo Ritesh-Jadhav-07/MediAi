@@ -1,13 +1,17 @@
 import mongoose from "mongoose";
 import { User } from "../models/user.model.js";
-import {Doctor} from "../models/doctor.model.js";
-import {asyncHandler} from "../utils/asyncHandler.js";
+import { Doctor } from "../models/doctor.model.js";
+import { asyncHandler } from "../utils/asyncHandler.js";
 
 const registerPatient = asyncHandler(async (req, res) => {
   try {
     const { name, email, password } = req.validatedData.body;
 
-    const existingUser = await User.findOne({ email });
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const existingUser = await User.findOne({
+      email: normalizedEmail,
+    });
 
     if (existingUser) {
       return res.status(409).json({
@@ -17,8 +21,8 @@ const registerPatient = asyncHandler(async (req, res) => {
     }
 
     const user = await User.create({
-      name,
-      email,
+      name: name.trim(),
+      email: normalizedEmail,
       password,
       role: "PATIENT",
       accountStatus: "ACTIVE",
@@ -44,6 +48,7 @@ const registerPatient = asyncHandler(async (req, res) => {
   }
 });
 
+
 const registerDoctor = asyncHandler(async (req, res) => {
   const session = await mongoose.startSession();
 
@@ -57,25 +62,10 @@ const registerDoctor = asyncHandler(async (req, res) => {
       registrationNumber,
       medicalCouncil,
       experience,
-    } = req.body;
-
-    if (
-      !name ||
-      !email ||
-      !password ||
-      !qualification ||
-      !specialization ||
-      !registrationNumber ||
-      !medicalCouncil ||
-      experience === undefined
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "All required fields must be provided",
-      });
-    }
+    } = req.validatedData.body;
 
     const normalizedEmail = email.toLowerCase().trim();
+
     const normalizedRegistrationNumber =
       registrationNumber.trim().toUpperCase();
 
@@ -163,4 +153,80 @@ const registerDoctor = asyncHandler(async (req, res) => {
   }
 });
 
-export { registerPatient, registerDoctor };
+
+const loginUser = asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
+
+  const normalizedEmail = email.toLowerCase().trim();
+
+  const user = await User.findOne({
+    email: normalizedEmail,
+  }).select("+password");
+
+  if (!user) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid email or password",
+    });
+  }
+
+  const isPasswordCorrect = await user.isPasswordValid(password);
+
+  if (!isPasswordCorrect) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid email or password",
+    });
+  }
+
+  if (user.accountStatus !== "ACTIVE") {
+    return res.status(403).json({
+      success: false,
+      message: "Your account is not active",
+    });
+  }
+
+  const accessToken = user.generateAccessToken();
+
+  let doctorData = null;
+
+  if (user.role === "DOCTOR") {
+    doctorData = await Doctor.findOne({
+      userId: user._id,
+    }).select("verificationStatus specialization qualification");
+  }
+
+  return res
+    .status(200)
+    .cookie("accessToken", accessToken)
+    .json({
+    success: true,
+    message: "Login successful",
+    data: {
+      user: {
+        userId: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      },
+      doctor: doctorData,
+      accessToken,
+    },
+  });
+});
+
+const getCurrentUser = asyncHandler(async (req, res) => {
+  return res.status(200).json({
+    success: true,
+    message: "User fetched successfully",
+    user: req.user,
+  });
+});
+
+
+export {
+  registerPatient,
+  registerDoctor,
+  loginUser,
+  getCurrentUser
+};
