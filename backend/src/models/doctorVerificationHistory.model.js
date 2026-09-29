@@ -8,9 +8,15 @@ const doctorVerificationHistorySchema = new mongoose.Schema(
       required: true,
     },
 
-    adminId: {
+    performedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
+      required: true,
+    },
+
+    performedByRole: {
+      type: String,
+      enum: ["ADMIN", "DOCTOR"],
       required: true,
     },
 

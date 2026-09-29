@@ -87,12 +87,13 @@ const approveDoctor = asyncHandler(async (req, res) => {
   await doctor.save();
 
   await DoctorVerificationHistory.create({
-    doctorId: doctor._id,
-    adminId: req.user._id,
-    previousStatus,
-    newStatus: "VERIFIED",
-    reason: null,
-  });
+  doctorId: doctor._id,
+  performedBy: req.user._id,
+  performedByRole: "ADMIN",
+  previousStatus,
+  newStatus: "VERIFIED",
+  reason: null,
+});
 
   return res.status(200).json({
     success: true,
@@ -142,12 +143,13 @@ const rejectDoctor = asyncHandler(async (req, res) => {
   await doctor.save();
 
   await DoctorVerificationHistory.create({
-    doctorId: doctor._id,
-    adminId: req.user._id,
-    previousStatus,
-    newStatus: "REJECTED",
-    reason: rejectionReason.trim(),
-  });
+  doctorId: doctor._id,
+  performedBy: req.user._id,
+  performedByRole: "ADMIN",
+  previousStatus,
+  newStatus: "REJECTED",
+  reason: rejectionReason.trim(),
+});
 
   return res.status(200).json({
     success: true,
@@ -169,13 +171,13 @@ const getDoctorVerificationHistory = asyncHandler(async (req, res) => {
   }
 
   const history = await DoctorVerificationHistory.find({
-    doctorId: doctor._id,
+  doctorId: doctor._id,
+})
+  .populate({
+    path: "performedBy",
+    select: "name email role",
   })
-    .populate({
-      path: "adminId",
-      select: "name email role",
-    })
-    .sort({ createdAt: -1 });
+  .sort({ createdAt: -1 });
 
   return res.status(200).json({
     success: true,
