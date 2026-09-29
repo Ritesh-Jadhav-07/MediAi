@@ -1,7 +1,9 @@
 import mongoose from "mongoose";
 import { User } from "../models/user.model.js";
 import { Doctor } from "../models/doctor.model.js";
+import { Patient } from "../models/patient.model.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
+
 
 const registerPatient = asyncHandler(async (req, res) => {
   try {
@@ -28,6 +30,11 @@ const registerPatient = asyncHandler(async (req, res) => {
       accountStatus: "ACTIVE",
     });
 
+    // Create patient-specific profile
+    await Patient.create({
+      userId: user._id,
+    });
+
     return res.status(201).json({
       success: true,
       message: "Patient registered successfully",
@@ -47,6 +54,7 @@ const registerPatient = asyncHandler(async (req, res) => {
     });
   }
 });
+
 
 
 const registerDoctor = asyncHandler(async (req, res) => {
