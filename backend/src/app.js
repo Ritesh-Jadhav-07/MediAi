@@ -11,6 +11,12 @@ app.use(express.urlencoded({ extended: true, limit: "16kb" }));
 app.use(express.static("public"));
 app.use(cookieParser());
 
+app.use(
+  cors({
+    origin: "http://localhost:5173",
+    credentials: true,
+  })
+);
 
 import authRoutes from "./routes/auth.routes.js";
 import adminRouter from "./routes/admin.routes.js";
