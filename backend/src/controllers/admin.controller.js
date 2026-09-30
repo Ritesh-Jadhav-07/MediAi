@@ -2,6 +2,8 @@ import { Doctor } from "../models/doctor.model.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { DoctorVerificationHistory } from "../models/doctorVerificationHistory.model.js";
 
+
+
 const getPendingDoctors = asyncHandler(async (req, res) => {
   const doctors = await Doctor.find({
     verificationStatus: "PENDING",
