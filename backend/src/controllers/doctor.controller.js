@@ -1,6 +1,7 @@
 import { Doctor } from "../models/doctor.model.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { DoctorAvailability } from "../models/doctorAvailability.model.js";
+import { DoctorVerificationHistory } from "../models/doctorVerificationHistory.model.js";
 
 // const updateDoctorProfile = asyncHandler(async (req, res) => {
 //   const userId = req.user._id;
