@@ -223,6 +223,25 @@ const loginUser = asyncHandler(async (req, res) => {
   });
 });
 
+const logoutUser = asyncHandler(async (req, res) => {
+  try {
+    return res
+      .status(200)
+      .clearCookie("accessToken")
+      .json({
+        success: true,
+        message: "User logged out successfully",
+      });
+  } catch (error) {
+    console.error("Logout error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to logout",
+    });
+  }
+});
+
 const getCurrentUser = asyncHandler(async (req, res) => {
   return res.status(200).json({
     success: true,
@@ -236,5 +255,6 @@ export {
   registerPatient,
   registerDoctor,
   loginUser,
-  getCurrentUser
+  getCurrentUser,
+  logoutUser,
 };

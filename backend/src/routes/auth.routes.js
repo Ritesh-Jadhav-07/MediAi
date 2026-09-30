@@ -3,7 +3,8 @@ import {
   registerPatient,
   registerDoctor,
   loginUser,
-  getCurrentUser
+  getCurrentUser,
+  logoutUser,
 } from "../controllers/auth.controller.js";
 
 import { authenticateUser } from "../middlewares/auth.middleware.js";
@@ -36,6 +37,12 @@ router.post(
   "/login",
   
   loginUser
+);
+
+router.post(
+  "/logout",
+  authenticateUser,
+  logoutUser
 );
 
 router.get("/me", authenticateUser, getCurrentUser);
