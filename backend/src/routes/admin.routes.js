@@ -8,6 +8,11 @@ import {
   approveDoctor,
   rejectDoctor,
   getDoctorVerificationHistory,
+  getAdminDashboardStats,
+  getAllUsers,
+  updateUserAccountStatus,
+  getAllDoctors,
+  updateDoctorVerificationStatus,
 } from "../controllers/admin.controller.js";
 
 const router = express.Router();
@@ -46,6 +51,44 @@ router.get(
   authorizeRoles("ADMIN"),
   getDoctorVerificationHistory
 );
+
+router.get(
+  "/dashboard/stats",
+  authenticateUser,
+  authorizeRoles("ADMIN"),
+  getAdminDashboardStats
+);
+
+router.get(
+  "/users",
+  authenticateUser,
+  authorizeRoles("ADMIN"),
+  getAllUsers
+);
+
+router.patch(
+  "/users/:userId/status",
+  authenticateUser,
+  authorizeRoles("ADMIN"),
+  updateUserAccountStatus
+);
+
+
+router.get(
+  "/doctors",
+  authenticateUser,
+  authorizeRoles("ADMIN"),
+  getAllDoctors
+);
+
+
+router.patch(
+  "/doctors/:doctorId/verification-status",
+  authenticateUser,
+  authorizeRoles("ADMIN"),
+  updateDoctorVerificationStatus
+);
+
 
 
 export default router;
