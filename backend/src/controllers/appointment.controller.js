@@ -3,6 +3,9 @@ import { Appointment } from "../models/appointment.model.js";
 import { Doctor } from "../models/doctor.model.js";
 import { User } from "../models/user.model.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
+import { AppointmentSlot } from "../models/appointmentSlot.model.js";
+import { generateAppointmentSlots } from "../utils/appointmentSlot.js";
+
 
 const bookAppointment = asyncHandler(async (req, res) => {
   const { doctorId, appointmentDate, durationMinutes = 30, reason } = req.body;
@@ -27,11 +30,13 @@ const bookAppointment = asyncHandler(async (req, res) => {
   if (
     !Number.isInteger(durationMinutes) ||
     durationMinutes < 5 ||
-    durationMinutes > 240
+    durationMinutes > 240 ||
+    durationMinutes % 5 !== 0
   ) {
     return res.status(400).json({
       success: false,
-      message: "Duration must be a whole number between 5 and 240 minutes",
+      message:
+        "Duration must be a multiple of five between 5 and 240 minutes",
     });
   }
 
@@ -47,11 +52,17 @@ const bookAppointment = asyncHandler(async (req, res) => {
     });
   }
 
-  // Validate date.
+  // Validate appointment date.
+  if (typeof appointmentDate !== "string") {
+    return res.status(400).json({
+      success: false,
+      message: "Appointment must have a valid future date and time",
+    });
+  }
+
   const startTime = new Date(appointmentDate);
 
   if (
-    typeof appointmentDate !== "string" ||
     Number.isNaN(startTime.getTime()) ||
     startTime <= new Date()
   ) {
@@ -61,7 +72,19 @@ const bookAppointment = asyncHandler(async (req, res) => {
     });
   }
 
-  const endTime = new Date(startTime.getTime() + durationMinutes * 60 * 1000);
+  // Require the start time to align to a five-minute boundary.
+  const SLOT_DURATION_MS = 5 * 60 * 1000;
+
+  if (startTime.getTime() % SLOT_DURATION_MS !== 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Appointment start time must align to a five-minute interval",
+    });
+  }
+
+  const endTime = new Date(
+    startTime.getTime() + durationMinutes * 60 * 1000
+  );
 
   // Verify the doctor's profile and verification status.
   const doctor = await Doctor.findById(doctorId);
@@ -81,7 +104,7 @@ const bookAppointment = asyncHandler(async (req, res) => {
   }
 
   const doctorUser = await User.findById(doctor.userId).select(
-    "name email role accountStatus",
+    "name email role accountStatus"
   );
 
   if (
@@ -97,7 +120,7 @@ const bookAppointment = asyncHandler(async (req, res) => {
 
   // Ensure the authenticated user is an active patient.
   const patient = await User.findById(req.user._id).select(
-    "role accountStatus",
+    "role accountStatus"
   );
 
   if (
@@ -127,6 +150,7 @@ const bookAppointment = asyncHandler(async (req, res) => {
     });
   }
 
+  // Create a pending request. Slots are reserved when the doctor accepts.
   const appointment = await Appointment.create({
     patientId: patient._id,
     doctorId: doctor._id,
@@ -143,6 +167,7 @@ const bookAppointment = asyncHandler(async (req, res) => {
     data: appointment,
   });
 });
+
 
 const getDoctorAppointmentRequests = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10, status = "PENDING" } = req.query;
@@ -211,6 +236,7 @@ const getDoctorAppointmentRequests = asyncHandler(async (req, res) => {
   });
 });
 
+
 const respondToAppointmentRequest = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
   const { action, rejectionReason } = req.body;
@@ -259,7 +285,9 @@ const respondToAppointmentRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  const doctorUser = await User.findById(req.user._id).select("accountStatus");
+  const doctorUser = await User.findById(req.user._id).select(
+    "accountStatus"
+  );
 
   if (!doctorUser || doctorUser.accountStatus !== "ACTIVE") {
     return res.status(403).json({
@@ -295,39 +323,107 @@ const respondToAppointmentRequest = asyncHandler(async (req, res) => {
   }
 
   if (action === "ACCEPT") {
-    // Recheck the doctor's current eligibility.
-    const currentDoctor = await Doctor.findById(doctor._id);
+    const session = await mongoose.startSession();
 
-    if (!currentDoctor || currentDoctor.verificationStatus !== "VERIFIED") {
-      return res.status(403).json({
-        success: false,
-        message: "Doctor is no longer verified",
+    try {
+      await session.withTransaction(async () => {
+        // Recheck that this request is still pending.
+        const currentAppointment = await Appointment.findOne({
+          _id: appointmentId,
+          doctorId: doctor._id,
+          status: "PENDING",
+        }).session(session);
+
+        if (!currentAppointment) {
+          const error = new Error(
+            "Appointment request is no longer pending"
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+
+        // Recheck the doctor's eligibility.
+        const currentDoctor = await Doctor.findById(doctor._id)
+          .session(session);
+
+        if (
+          !currentDoctor ||
+          currentDoctor.verificationStatus !== "VERIFIED"
+        ) {
+          const error = new Error("Doctor is no longer verified");
+          error.statusCode = 403;
+          throw error;
+        }
+
+        const currentDoctorUser = await User.findById(req.user._id)
+          .select("accountStatus")
+          .session(session);
+
+        if (
+          !currentDoctorUser ||
+          currentDoctorUser.accountStatus !== "ACTIVE"
+        ) {
+          const error = new Error("Doctor account is not active");
+          error.statusCode = 403;
+          throw error;
+        }
+
+        // Generate five-minute slots for the appointment.
+        const slots = generateAppointmentSlots(
+          currentAppointment.appointmentDate,
+          currentAppointment.appointmentEnd
+        );
+
+        // Reserve all slots. The unique index prevents two
+        // appointments from reserving the same doctor's time.
+        await AppointmentSlot.insertMany(
+          slots.map((slotStart) => ({
+            doctorId: doctor._id,
+            appointmentId: currentAppointment._id,
+            slotStart,
+          })),
+          {
+            session,
+            ordered: true,
+          }
+        );
+
+        // Confirm the appointment in the same transaction.
+        currentAppointment.status = "CONFIRMED";
+        currentAppointment.rejectionReason = null;
+
+        await currentAppointment.save({ session });
+
+        // Preserve the confirmed document for the response.
+        Object.assign(appointment, currentAppointment.toObject());
       });
+    } catch (error) {
+      if (error.code === 11000) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "This time slot is already reserved. Please choose another appointment time.",
+        });
+      }
+
+      if (error.statusCode) {
+        return res.status(error.statusCode).json({
+          success: false,
+          message: error.message,
+        });
+      }
+
+      throw error;
+    } finally {
+      await session.endSession();
     }
-
-    const conflictingAppointment = await Appointment.findOne({
-      _id: { $ne: appointment._id },
-      doctorId: doctor._id,
-      status: { $in: ["SCHEDULED", "CONFIRMED"] },
-      appointmentDate: { $lt: appointment.appointmentEnd },
-      appointmentEnd: { $gt: appointment.appointmentDate },
-    }).select("_id");
-
-    if (conflictingAppointment) {
-      return res.status(409).json({
-        success: false,
-        message: "This appointment overlaps with another scheduled appointment",
-      });
-    }
-
-    appointment.status = "CONFIRMED";
-    appointment.rejectionReason = null;
   } else {
+    // Reject the pending appointment.
     appointment.status = "REJECTED";
     appointment.rejectionReason = rejectionReason.trim();
-  }
 
-  await appointment.save();
+    await appointment.save();
+  }
 
   return res.status(200).json({
     success: true,
@@ -338,6 +434,7 @@ const respondToAppointmentRequest = asyncHandler(async (req, res) => {
     data: appointment,
   });
 });
+
 
 const getPatientAppointments = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10, status } = req.query;
@@ -402,19 +499,20 @@ const getPatientAppointments = asyncHandler(async (req, res) => {
   });
 });
 
+
 const cancelAppointment = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
   const { cancellationReason } = req.body;
 
-  // Validate appointment ID
-  if (!mongoose.Types.ObjectId.isValid(appointmentId)) {
+  // Validate appointment ID.
+  if (!mongoose.isValidObjectId(appointmentId)) {
     return res.status(400).json({
       success: false,
       message: "Invalid appointment ID",
     });
   }
 
-  // Validate optional cancellation reason
+  // Validate optional cancellation reason.
   if (
     cancellationReason !== undefined &&
     (typeof cancellationReason !== "string" ||
@@ -426,7 +524,7 @@ const cancelAppointment = asyncHandler(async (req, res) => {
     });
   }
 
-  // Find only an appointment belonging to the logged-in patient
+  // Find an appointment belonging to the logged-in patient.
   const appointment = await Appointment.findOne({
     _id: appointmentId,
     patientId: req.user._id,
@@ -439,7 +537,7 @@ const cancelAppointment = asyncHandler(async (req, res) => {
     });
   }
 
-  // Only pending or confirmed appointments can be cancelled
+  // Only pending or confirmed appointments can be cancelled.
   const cancellableStatuses = ["PENDING", "CONFIRMED", "SCHEDULED"];
 
   if (!cancellableStatuses.includes(appointment.status)) {
@@ -449,7 +547,7 @@ const cancelAppointment = asyncHandler(async (req, res) => {
     });
   }
 
-  // Prevent cancellation after the appointment has started
+  // Prevent cancellation after the appointment has started.
   if (appointment.appointmentDate <= new Date()) {
     return res.status(400).json({
       success: false,
@@ -457,19 +555,67 @@ const cancelAppointment = asyncHandler(async (req, res) => {
     });
   }
 
-  appointment.status = "CANCELLED";
-  appointment.cancellationReason = cancellationReason?.trim() || null;
-  appointment.cancelledBy = req.user._id;
-  appointment.cancelledAt = new Date();
+  const session = await mongoose.startSession();
 
-  await appointment.save();
+  try {
+    let cancelledAppointment;
 
-  return res.status(200).json({
-    success: true,
-    message: "Appointment cancelled successfully",
-    data: appointment,
-  });
+    await session.withTransaction(async () => {
+      // Recheck ownership and status inside the transaction.
+      const currentAppointment = await Appointment.findOne({
+        _id: appointmentId,
+        patientId: req.user._id,
+        status: { $in: cancellableStatuses },
+        appointmentDate: { $gt: new Date() },
+      }).session(session);
+
+      if (!currentAppointment) {
+        const error = new Error(
+          "Appointment is no longer eligible for cancellation"
+        );
+        error.statusCode = 409;
+        throw error;
+      }
+
+      // Release any reserved slots belonging to this appointment.
+      await AppointmentSlot.deleteMany(
+        {
+          appointmentId: currentAppointment._id,
+        },
+        { session }
+      );
+
+      // Cancel the appointment.
+      currentAppointment.status = "CANCELLED";
+      currentAppointment.cancellationReason =
+        cancellationReason?.trim() || null;
+      currentAppointment.cancelledBy = req.user._id;
+      currentAppointment.cancelledAt = new Date();
+
+      await currentAppointment.save({ session });
+
+      cancelledAppointment = currentAppointment.toObject();
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Appointment cancelled successfully",
+      data: cancelledAppointment,
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+      });
+    }
+
+    throw error;
+  } finally {
+    await session.endSession();
+  }
 });
+
 
 const updateAppointmentOutcome = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
@@ -646,19 +792,20 @@ const getDoctorAppointments = asyncHandler(async (req, res) => {
   });
 });
 
+
 const requestAppointmentReschedule = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
   const { newAppointmentDate, durationMinutes, reason } = req.body;
 
-  // Validate appointment ID
-  if (!mongoose.Types.ObjectId.isValid(appointmentId)) {
+  // Validate appointment ID.
+  if (!mongoose.isValidObjectId(appointmentId)) {
     return res.status(400).json({
       success: false,
       message: "Invalid appointment ID",
     });
   }
 
-  // Validate requested date and time
+  // Validate requested date and time.
   if (!newAppointmentDate) {
     return res.status(400).json({
       success: false,
@@ -682,17 +829,34 @@ const requestAppointmentReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Validate duration
-  const duration = durationMinutes === undefined ? 30 : Number(durationMinutes);
+  // Require the start time to align to a five-minute boundary.
+  const SLOT_DURATION_MS = 5 * 60 * 1000;
 
-  if (!Number.isInteger(duration) || duration < 5 || duration > 240) {
+  if (startTime.getTime() % SLOT_DURATION_MS !== 0) {
     return res.status(400).json({
       success: false,
-      message: "Duration must be a whole number between 5 and 240 minutes",
+      message: "Appointment start time must align to a five-minute interval",
     });
   }
 
-  // Validate optional reason
+  // Validate duration.
+  const duration =
+    durationMinutes === undefined ? 30 : Number(durationMinutes);
+
+  if (
+    !Number.isInteger(duration) ||
+    duration < 5 ||
+    duration > 240 ||
+    duration % 5 !== 0
+  ) {
+    return res.status(400).json({
+      success: false,
+      message:
+        "Duration must be a multiple of five between 5 and 240 minutes",
+    });
+  }
+
+  // Validate optional reason.
   if (
     reason !== undefined &&
     (typeof reason !== "string" || reason.trim().length > 500)
@@ -703,7 +867,7 @@ const requestAppointmentReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Find only an appointment belonging to the logged-in patient
+  // Find an appointment belonging to the logged-in patient.
   const appointment = await Appointment.findOne({
     _id: appointmentId,
     patientId: req.user._id,
@@ -716,7 +880,7 @@ const requestAppointmentReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Rescheduling is allowed only for future confirmed appointments
+  // Only future confirmed appointments can be rescheduled.
   if (
     !["CONFIRMED", "SCHEDULED"].includes(appointment.status) ||
     appointment.appointmentDate <= new Date()
@@ -727,7 +891,7 @@ const requestAppointmentReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Do not allow multiple pending reschedule requests
+  // Do not allow multiple pending reschedule requests.
   if (appointment.rescheduleRequest?.status === "PENDING") {
     return res.status(409).json({
       success: false,
@@ -735,9 +899,11 @@ const requestAppointmentReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  const endTime = new Date(startTime.getTime() + duration * 60 * 1000);
+  const endTime = new Date(
+    startTime.getTime() + duration * 60 * 1000
+  );
 
-  // Ensure the doctor has no overlapping confirmed appointment
+  // Check for overlapping confirmed appointments.
   const conflictingAppointment = await Appointment.findOne({
     _id: { $ne: appointment._id },
     doctorId: appointment.doctorId,
@@ -754,8 +920,7 @@ const requestAppointmentReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Store the proposed time without changing the original appointment
-
+  // Store the proposed time without changing the original appointment.
   appointment.rescheduleRequest = {
     requestedDate: startTime,
     requestedEnd: endTime,
@@ -781,19 +946,20 @@ const requestAppointmentReschedule = asyncHandler(async (req, res) => {
 });
 
 
+
 const respondToRescheduleRequest = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
   const { action, rejectionReason } = req.body;
 
-  // Validate appointment ID
-  if (!mongoose.Types.ObjectId.isValid(appointmentId)) {
+  // Validate appointment ID.
+  if (!mongoose.isValidObjectId(appointmentId)) {
     return res.status(400).json({
       success: false,
       message: "Invalid appointment ID",
     });
   }
 
-  // Validate action
+  // Validate action.
   if (!["ACCEPT", "REJECT"].includes(action)) {
     return res.status(400).json({
       success: false,
@@ -801,7 +967,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // Validate rejection reason
+  // Validate rejection reason.
   if (
     action === "REJECT" &&
     (typeof rejectionReason !== "string" ||
@@ -814,7 +980,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // Verify the logged-in doctor
+  // Verify the logged-in doctor.
   const doctor = await Doctor.findOne({
     userId: req.user._id,
     verificationStatus: "VERIFIED",
@@ -827,7 +993,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // Verify doctor account is active
+  // Verify doctor account is active.
   const doctorUser = await User.findById(req.user._id).select(
     "accountStatus"
   );
@@ -839,7 +1005,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // Ensure the appointment belongs to this doctor
+  // Ensure the appointment belongs to this doctor.
   const appointment = await Appointment.findOne({
     _id: appointmentId,
     doctorId: doctor._id,
@@ -852,7 +1018,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // The original appointment must still be active and in the future
+  // The original appointment must still be active and in the future.
   if (
     !["CONFIRMED", "SCHEDULED"].includes(appointment.status) ||
     appointment.appointmentDate <= new Date()
@@ -865,7 +1031,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
 
   const request = appointment.rescheduleRequest;
 
-  // Verify a pending request exists
+  // Verify a pending request exists.
   if (!request || request.status !== "PENDING") {
     return res.status(400).json({
       success: false,
@@ -874,7 +1040,6 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
   }
 
   // Doctors may respond only to patient-initiated requests.
-  // A null role is allowed for backward compatibility with older requests.
   if (request.requestedByRole === "DOCTOR") {
     return res.status(400).json({
       success: false,
@@ -882,7 +1047,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // Validate proposed appointment time
+  // Validate the proposed appointment time.
   if (
     !request.requestedDate ||
     !request.requestedEnd ||
@@ -896,36 +1061,136 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
   }
 
   if (action === "ACCEPT") {
-    // Recheck scheduling conflicts before accepting
-    const conflictingAppointment = await Appointment.findOne({
-      _id: { $ne: appointment._id },
-      doctorId: doctor._id,
-      status: { $in: ["CONFIRMED", "SCHEDULED"] },
-      appointmentDate: { $lt: request.requestedEnd },
-      appointmentEnd: { $gt: request.requestedDate },
-    }).select("_id");
+    const session = await mongoose.startSession();
 
-    if (conflictingAppointment) {
-      return res.status(409).json({
-        success: false,
-        message: "The requested time is no longer available",
+    try {
+      let updatedAppointment;
+
+      await session.withTransaction(async () => {
+        // Re-read the appointment and pending request inside the transaction.
+        const currentAppointment = await Appointment.findOne({
+          _id: appointmentId,
+          doctorId: doctor._id,
+          status: { $in: ["CONFIRMED", "SCHEDULED"] },
+          "rescheduleRequest.status": "PENDING",
+          "rescheduleRequest.requestedByRole": { $ne: "DOCTOR" },
+          appointmentDate: { $gt: new Date() },
+        }).session(session);
+
+        if (!currentAppointment) {
+          const error = new Error(
+            "Appointment or rescheduling request is no longer eligible"
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+
+        const currentRequest = currentAppointment.rescheduleRequest;
+
+        if (
+          !currentRequest.requestedDate ||
+          !currentRequest.requestedEnd ||
+          currentRequest.requestedDate <= new Date() ||
+          currentRequest.requestedEnd <= currentRequest.requestedDate
+        ) {
+          const error = new Error(
+            "The requested appointment time is no longer valid"
+          );
+          error.statusCode = 400;
+          throw error;
+        }
+
+        // Recheck for overlapping confirmed appointments.
+        const conflictingAppointment = await Appointment.findOne({
+          _id: { $ne: currentAppointment._id },
+          doctorId: doctor._id,
+          status: { $in: ["CONFIRMED", "SCHEDULED"] },
+          appointmentDate: { $lt: currentRequest.requestedEnd },
+          appointmentEnd: { $gt: currentRequest.requestedDate },
+        })
+          .select("_id")
+          .session(session);
+
+        if (conflictingAppointment) {
+          const error = new Error(
+            "The requested time is no longer available"
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+
+        // Generate slots before modifying the existing reservations.
+        const newSlots = generateAppointmentSlots(
+          currentRequest.requestedDate,
+          currentRequest.requestedEnd
+        );
+
+        // Remove the old reservations.
+        await AppointmentSlot.deleteMany(
+          { appointmentId: currentAppointment._id },
+          { session }
+        );
+
+        // Reserve the new slots. The unique index prevents collisions.
+        await AppointmentSlot.insertMany(
+          newSlots.map((slotStart) => ({
+            doctorId: doctor._id,
+            appointmentId: currentAppointment._id,
+            slotStart,
+          })),
+          { session, ordered: true }
+        );
+
+        // Update the appointment's scheduled time.
+        currentAppointment.appointmentDate = currentRequest.requestedDate;
+        currentAppointment.appointmentEnd = currentRequest.requestedEnd;
+
+        if (currentRequest.requestedDurationMinutes != null) {
+          currentAppointment.durationMinutes =
+            currentRequest.requestedDurationMinutes;
+        }
+
+        // Record the decision.
+        currentRequest.status = "ACCEPTED";
+        currentRequest.rejectionReason = null;
+        currentRequest.reviewedAt = new Date();
+        currentRequest.reviewedBy = req.user._id;
+        currentRequest.reviewedByRole = "DOCTOR";
+
+        await currentAppointment.save({ session });
+
+        updatedAppointment = currentAppointment.toObject();
       });
+
+      return res.status(200).json({
+        success: true,
+        message: "Rescheduling request accepted successfully",
+        data: updatedAppointment,
+      });
+    } catch (error) {
+      if (error.code === 11000) {
+        return res.status(409).json({
+          success: false,
+          message: "The requested time is no longer available",
+        });
+      }
+
+      if (error.statusCode) {
+        return res.status(error.statusCode).json({
+          success: false,
+          message: error.message,
+        });
+      }
+
+      throw error;
+    } finally {
+      await session.endSession();
     }
-
-    // Apply the proposed appointment time
-    appointment.appointmentDate = request.requestedDate;
-    appointment.appointmentEnd = request.requestedEnd;
-    appointment.durationMinutes = request.requestedDurationMinutes;
-
-    request.status = "ACCEPTED";
-    request.rejectionReason = null;
-  } else {
-    // Preserve the original appointment time
-    request.status = "REJECTED";
-    request.rejectionReason = rejectionReason.trim();
   }
 
-  // Record who reviewed the request
+  // Rejecting a request leaves the original appointment time unchanged.
+  request.status = "REJECTED";
+  request.rejectionReason = rejectionReason.trim();
   request.reviewedAt = new Date();
   request.reviewedBy = req.user._id;
   request.reviewedByRole = "DOCTOR";
@@ -934,32 +1199,36 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
 
   return res.status(200).json({
     success: true,
-    message:
-      action === "ACCEPT"
-        ? "Rescheduling request accepted successfully"
-        : "Rescheduling request rejected successfully",
+    message: "Rescheduling request rejected successfully",
     data: appointment,
   });
 });
+
 
 
 const requestDoctorReschedule = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
   const { newAppointmentDate, durationMinutes, reason } = req.body;
 
-  // Validate appointment ID
-  if (!mongoose.Types.ObjectId.isValid(appointmentId)) {
+  // Validate appointment ID.
+  if (!mongoose.isValidObjectId(appointmentId)) {
     return res.status(400).json({
       success: false,
       message: "Invalid appointment ID",
     });
   }
 
-  // Validate proposed date
+  // Validate proposed date.
+  if (!newAppointmentDate) {
+    return res.status(400).json({
+      success: false,
+      message: "A valid future appointment date is required",
+    });
+  }
+
   const startTime = new Date(newAppointmentDate);
 
   if (
-    !newAppointmentDate ||
     Number.isNaN(startTime.getTime()) ||
     startTime <= new Date()
   ) {
@@ -969,7 +1238,17 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Verify doctor is verified
+  // Require start time to align to a five-minute boundary.
+  const SLOT_DURATION_MS = 5 * 60 * 1000;
+
+  if (startTime.getTime() % SLOT_DURATION_MS !== 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Appointment start time must align to a five-minute interval",
+    });
+  }
+
+  // Verify doctor is verified.
   const doctor = await Doctor.findOne({
     userId: req.user._id,
     verificationStatus: "VERIFIED",
@@ -982,10 +1261,8 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Verify doctor account is active
-  const doctorUser = await User.findById(req.user._id).select(
-    "accountStatus"
-  );
+  // Verify doctor account is active.
+  const doctorUser = await User.findById(req.user._id).select("accountStatus");
 
   if (!doctorUser || doctorUser.accountStatus !== "ACTIVE") {
     return res.status(403).json({
@@ -994,7 +1271,7 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Find appointment belonging to this doctor
+  // Find appointment belonging to this doctor.
   const appointment = await Appointment.findOne({
     _id: appointmentId,
     doctorId: doctor._id,
@@ -1007,7 +1284,7 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Original appointment must be active and in the future
+  // Original appointment must be active and in the future.
   if (
     !["CONFIRMED", "SCHEDULED"].includes(appointment.status) ||
     appointment.appointmentDate <= new Date()
@@ -1018,7 +1295,7 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Do not allow multiple pending requests
+  // Do not allow multiple pending requests.
   if (appointment.rescheduleRequest?.status === "PENDING") {
     return res.status(409).json({
       success: false,
@@ -1026,7 +1303,7 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Use existing appointment duration unless a new duration is supplied
+  // Use existing appointment duration unless a new duration is supplied.
   const duration =
     durationMinutes === undefined
       ? appointment.durationMinutes
@@ -1035,15 +1312,17 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
   if (
     !Number.isInteger(duration) ||
     duration < 5 ||
-    duration > 240
+    duration > 240 ||
+    duration % 5 !== 0
   ) {
     return res.status(400).json({
       success: false,
-      message: "Duration must be an integer between 5 and 240 minutes",
+      message:
+        "Duration must be a multiple of five between 5 and 240 minutes",
     });
   }
 
-  // Validate reason
+  // Validate reason.
   if (
     reason !== undefined &&
     (typeof reason !== "string" || reason.trim().length > 500)
@@ -1054,9 +1333,11 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  const endTime = new Date(startTime.getTime() + duration * 60 * 1000);
+  const endTime = new Date(
+    startTime.getTime() + duration * 60 * 1000
+  );
 
-  // Check for conflicts with other confirmed/scheduled appointments
+  // Check for conflicts with other confirmed/scheduled appointments.
   const conflictingAppointment = await Appointment.findOne({
     _id: { $ne: appointment._id },
     doctorId: doctor._id,
@@ -1072,7 +1353,7 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  // Create a doctor-initiated reschedule request
+  // Save the proposal without changing the original appointment time.
   appointment.rescheduleRequest = {
     requestedDate: startTime,
     requestedEnd: endTime,
@@ -1098,15 +1379,11 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
 });
 
 
-
 const getPendingRescheduleRequests = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10 } = req.query;
 
   const pageNumber = Math.max(1, Number.parseInt(page, 10) || 1);
-  const pageSize = Math.min(
-    100,
-    Math.max(1, Number.parseInt(limit, 10) || 10)
-  );
+  const pageSize = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 10));
 
   // Find the logged-in doctor's profile
   const doctor = await Doctor.findOne({
@@ -1122,9 +1399,7 @@ const getPendingRescheduleRequests = asyncHandler(async (req, res) => {
   }
 
   // Verify doctor account is active
-  const doctorUser = await User.findById(req.user._id).select(
-    "accountStatus"
-  );
+  const doctorUser = await User.findById(req.user._id).select("accountStatus");
 
   if (!doctorUser || doctorUser.accountStatus !== "ACTIVE") {
     return res.status(403).json({
@@ -1173,15 +1448,15 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
   const { action, rejectionReason } = req.body;
 
-  // Validate appointment ID
-  if (!mongoose.Types.ObjectId.isValid(appointmentId)) {
+  // Validate appointment ID.
+  if (!mongoose.isValidObjectId(appointmentId)) {
     return res.status(400).json({
       success: false,
       message: "Invalid appointment ID",
     });
   }
 
-  // Validate action
+  // Validate action.
   if (!["ACCEPT", "REJECT"].includes(action)) {
     return res.status(400).json({
       success: false,
@@ -1189,7 +1464,7 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // Validate rejection reason
+  // Validate rejection reason.
   if (
     action === "REJECT" &&
     (typeof rejectionReason !== "string" ||
@@ -1202,7 +1477,7 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // Verify patient account is active
+  // Verify patient account is active.
   const patient = await User.findOne({
     _id: req.user._id,
     role: "PATIENT",
@@ -1216,7 +1491,7 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // Ensure the appointment belongs to this patient
+  // Ensure the appointment belongs to this patient.
   const appointment = await Appointment.findOne({
     _id: appointmentId,
     patientId: patient._id,
@@ -1229,7 +1504,7 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // Original appointment must still be active and in the future
+  // Original appointment must still be active and in the future.
   if (
     !["CONFIRMED", "SCHEDULED"].includes(appointment.status) ||
     appointment.appointmentDate <= new Date()
@@ -1242,7 +1517,7 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
 
   const request = appointment.rescheduleRequest;
 
-  // Verify pending request was initiated by the doctor
+  // Verify pending request was initiated by the doctor.
   if (
     !request ||
     request.status !== "PENDING" ||
@@ -1254,7 +1529,7 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  // Validate the proposed time
+  // Validate the proposed time.
   if (
     !request.requestedDate ||
     !request.requestedEnd ||
@@ -1268,36 +1543,141 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
   }
 
   if (action === "ACCEPT") {
-    // Recheck for scheduling conflicts before accepting
-    const conflictingAppointment = await Appointment.findOne({
-      _id: { $ne: appointment._id },
-      doctorId: appointment.doctorId,
-      status: { $in: ["CONFIRMED", "SCHEDULED"] },
-      appointmentDate: { $lt: request.requestedEnd },
-      appointmentEnd: { $gt: request.requestedDate },
-    }).select("_id");
+    const session = await mongoose.startSession();
 
-    if (conflictingAppointment) {
-      return res.status(409).json({
-        success: false,
-        message: "The requested time is no longer available",
+    try {
+      let updatedAppointment;
+
+      await session.withTransaction(async () => {
+        // Recheck ownership, appointment status, and request state.
+        const currentAppointment = await Appointment.findOne({
+          _id: appointmentId,
+          patientId: patient._id,
+          status: { $in: ["CONFIRMED", "SCHEDULED"] },
+          appointmentDate: { $gt: new Date() },
+          "rescheduleRequest.status": "PENDING",
+          "rescheduleRequest.requestedByRole": "DOCTOR",
+        }).session(session);
+
+        if (!currentAppointment) {
+          const error = new Error(
+            "Appointment or rescheduling request is no longer eligible"
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+
+        const currentRequest = currentAppointment.rescheduleRequest;
+
+        // Validate the proposed time again inside the transaction.
+        if (
+          !currentRequest.requestedDate ||
+          !currentRequest.requestedEnd ||
+          currentRequest.requestedDate <= new Date() ||
+          currentRequest.requestedEnd <= currentRequest.requestedDate
+        ) {
+          const error = new Error(
+            "The requested appointment time is no longer valid"
+          );
+          error.statusCode = 400;
+          throw error;
+        }
+
+        // Check for overlapping appointments with the same doctor.
+        const conflictingAppointment = await Appointment.findOne({
+          _id: { $ne: currentAppointment._id },
+          doctorId: currentAppointment.doctorId,
+          status: { $in: ["CONFIRMED", "SCHEDULED"] },
+          appointmentDate: { $lt: currentRequest.requestedEnd },
+          appointmentEnd: { $gt: currentRequest.requestedDate },
+        })
+          .select("_id")
+          .session(session);
+
+        if (conflictingAppointment) {
+          const error = new Error(
+            "The requested time is no longer available"
+          );
+          error.statusCode = 409;
+          throw error;
+        }
+
+        // Generate the proposed time slots.
+        const newSlots = generateAppointmentSlots(
+          currentRequest.requestedDate,
+          currentRequest.requestedEnd
+        );
+
+        // Release the old reservations.
+        await AppointmentSlot.deleteMany(
+          { appointmentId: currentAppointment._id },
+          { session }
+        );
+
+        // Reserve the new slots.
+        // The unique index protects against duplicate reservations.
+        await AppointmentSlot.insertMany(
+          newSlots.map((slotStart) => ({
+            doctorId: currentAppointment.doctorId,
+            appointmentId: currentAppointment._id,
+            slotStart,
+          })),
+          {
+            session,
+            ordered: true,
+          }
+        );
+
+        // Apply the new appointment time.
+        currentAppointment.appointmentDate = currentRequest.requestedDate;
+        currentAppointment.appointmentEnd = currentRequest.requestedEnd;
+
+        if (currentRequest.requestedDurationMinutes != null) {
+          currentAppointment.durationMinutes =
+            currentRequest.requestedDurationMinutes;
+        }
+
+        // Record the patient's decision.
+        currentRequest.status = "ACCEPTED";
+        currentRequest.rejectionReason = null;
+        currentRequest.reviewedAt = new Date();
+        currentRequest.reviewedBy = patient._id;
+        currentRequest.reviewedByRole = "PATIENT";
+
+        await currentAppointment.save({ session });
+
+        updatedAppointment = currentAppointment.toObject();
       });
+
+      return res.status(200).json({
+        success: true,
+        message: "Doctor's rescheduling request accepted successfully",
+        data: updatedAppointment,
+      });
+    } catch (error) {
+      if (error.code === 11000) {
+        return res.status(409).json({
+          success: false,
+          message: "The requested time is no longer available",
+        });
+      }
+
+      if (error.statusCode) {
+        return res.status(error.statusCode).json({
+          success: false,
+          message: error.message,
+        });
+      }
+
+      throw error;
+    } finally {
+      await session.endSession();
     }
-
-    // Apply the proposed appointment time
-    appointment.appointmentDate = request.requestedDate;
-    appointment.appointmentEnd = request.requestedEnd;
-    appointment.durationMinutes = request.requestedDurationMinutes;
-
-    request.status = "ACCEPTED";
-    request.rejectionReason = null;
-  } else {
-    // Keep the original appointment time
-    request.status = "REJECTED";
-    request.rejectionReason = rejectionReason.trim();
   }
 
-  // Record the patient's response
+  // Rejecting the request leaves the original appointment time unchanged.
+  request.status = "REJECTED";
+  request.rejectionReason = rejectionReason.trim();
   request.reviewedAt = new Date();
   request.reviewedBy = patient._id;
   request.reviewedByRole = "PATIENT";
@@ -1306,10 +1686,7 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
 
   return res.status(200).json({
     success: true,
-    message:
-      action === "ACCEPT"
-        ? "Doctor's rescheduling request accepted successfully"
-        : "Doctor's rescheduling request rejected successfully",
+    message: "Doctor's rescheduling request rejected successfully",
     data: appointment,
   });
 });
@@ -1319,10 +1696,7 @@ const getPendingDoctorRescheduleRequests = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10 } = req.query;
 
   const pageNumber = Math.max(1, Number.parseInt(page, 10) || 1);
-  const pageSize = Math.min(
-    100,
-    Math.max(1, Number.parseInt(limit, 10) || 10)
-  );
+  const pageSize = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 10));
 
   // Verify patient account is active
   const patient = await User.findOne({
@@ -1377,7 +1751,6 @@ const getPendingDoctorRescheduleRequests = asyncHandler(async (req, res) => {
   });
 });
 
-
 export {
   bookAppointment,
   getDoctorAppointmentRequests,
@@ -1389,7 +1762,7 @@ export {
   requestAppointmentReschedule,
   respondToRescheduleRequest,
   getPendingRescheduleRequests,
-    requestDoctorReschedule,
-    respondToDoctorRescheduleRequest,
-    getPendingDoctorRescheduleRequests,
+  requestDoctorReschedule,
+  respondToDoctorRescheduleRequest,
+  getPendingDoctorRescheduleRequests,
 };
