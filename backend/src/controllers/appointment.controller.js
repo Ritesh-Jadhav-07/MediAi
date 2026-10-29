@@ -5,7 +5,7 @@ import { User } from "../models/user.model.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { AppointmentSlot } from "../models/appointmentSlot.model.js";
 import { generateAppointmentSlots } from "../utils/appointmentSlot.js";
-
+import { sendEmail } from "../utils/emailService.js";
 
 const bookAppointment = asyncHandler(async (req, res) => {
   const { doctorId, appointmentDate, durationMinutes = 30, reason } = req.body;
@@ -35,8 +35,7 @@ const bookAppointment = asyncHandler(async (req, res) => {
   ) {
     return res.status(400).json({
       success: false,
-      message:
-        "Duration must be a multiple of five between 5 and 240 minutes",
+      message: "Duration must be a multiple of five between 5 and 240 minutes",
     });
   }
 
@@ -62,10 +61,7 @@ const bookAppointment = asyncHandler(async (req, res) => {
 
   const startTime = new Date(appointmentDate);
 
-  if (
-    Number.isNaN(startTime.getTime()) ||
-    startTime <= new Date()
-  ) {
+  if (Number.isNaN(startTime.getTime()) || startTime <= new Date()) {
     return res.status(400).json({
       success: false,
       message: "Appointment must have a valid future date and time",
@@ -82,9 +78,7 @@ const bookAppointment = asyncHandler(async (req, res) => {
     });
   }
 
-  const endTime = new Date(
-    startTime.getTime() + durationMinutes * 60 * 1000
-  );
+  const endTime = new Date(startTime.getTime() + durationMinutes * 60 * 1000);
 
   // Verify the doctor's profile and verification status.
   const doctor = await Doctor.findById(doctorId);
@@ -104,7 +98,7 @@ const bookAppointment = asyncHandler(async (req, res) => {
   }
 
   const doctorUser = await User.findById(doctor.userId).select(
-    "name email role accountStatus"
+    "name email role accountStatus",
   );
 
   if (
@@ -120,7 +114,7 @@ const bookAppointment = asyncHandler(async (req, res) => {
 
   // Ensure the authenticated user is an active patient.
   const patient = await User.findById(req.user._id).select(
-    "role accountStatus"
+    "role accountStatus",
   );
 
   if (
@@ -167,7 +161,6 @@ const bookAppointment = asyncHandler(async (req, res) => {
     data: appointment,
   });
 });
-
 
 const getDoctorAppointmentRequests = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10, status = "PENDING" } = req.query;
@@ -236,7 +229,6 @@ const getDoctorAppointmentRequests = asyncHandler(async (req, res) => {
   });
 });
 
-
 const respondToAppointmentRequest = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
   const { action, rejectionReason } = req.body;
@@ -285,9 +277,7 @@ const respondToAppointmentRequest = asyncHandler(async (req, res) => {
     });
   }
 
-  const doctorUser = await User.findById(req.user._id).select(
-    "accountStatus"
-  );
+  const doctorUser = await User.findById(req.user._id).select("accountStatus");
 
   if (!doctorUser || doctorUser.accountStatus !== "ACTIVE") {
     return res.status(403).json({
@@ -335,21 +325,17 @@ const respondToAppointmentRequest = asyncHandler(async (req, res) => {
         }).session(session);
 
         if (!currentAppointment) {
-          const error = new Error(
-            "Appointment request is no longer pending"
-          );
+          const error = new Error("Appointment request is no longer pending");
           error.statusCode = 409;
           throw error;
         }
 
         // Recheck the doctor's eligibility.
-        const currentDoctor = await Doctor.findById(doctor._id)
-          .session(session);
+        const currentDoctor = await Doctor.findById(doctor._id).session(
+          session,
+        );
 
-        if (
-          !currentDoctor ||
-          currentDoctor.verificationStatus !== "VERIFIED"
-        ) {
+        if (!currentDoctor || currentDoctor.verificationStatus !== "VERIFIED") {
           const error = new Error("Doctor is no longer verified");
           error.statusCode = 403;
           throw error;
@@ -371,7 +357,7 @@ const respondToAppointmentRequest = asyncHandler(async (req, res) => {
         // Generate five-minute slots for the appointment.
         const slots = generateAppointmentSlots(
           currentAppointment.appointmentDate,
-          currentAppointment.appointmentEnd
+          currentAppointment.appointmentEnd,
         );
 
         // Reserve all slots. The unique index prevents two
@@ -385,7 +371,7 @@ const respondToAppointmentRequest = asyncHandler(async (req, res) => {
           {
             session,
             ordered: true,
-          }
+          },
         );
 
         // Confirm the appointment in the same transaction.
@@ -425,6 +411,52 @@ const respondToAppointmentRequest = asyncHandler(async (req, res) => {
     await appointment.save();
   }
 
+  // Send an email to the patient after the appointment status is saved.
+  try {
+    const patient = await User.findById(appointment.patientId).select(
+      "name email",
+    );
+
+    if (patient?.email) {
+      const isAccepted = action === "ACCEPT";
+      const appointmentDate = new Date(
+        appointment.appointmentDate,
+      ).toLocaleString("en-IN", {
+        timeZone: "Asia/Kolkata",
+        dateStyle: "medium",
+        timeStyle: "short",
+      });
+
+      await sendEmail({
+        to: patient.email,
+        subject: isAccepted
+          ? "MediAI: Appointment Accepted"
+          : "MediAI: Appointment Rejected",
+        text: [
+          `Hello ${patient.name || "Patient"},`,
+          "",
+          isAccepted
+            ? "Your appointment request has been accepted by the doctor."
+            : "Your appointment request has been rejected by the doctor.",
+          "",
+          `Appointment date and time: ${appointmentDate} (IST)`,
+          "",
+          "Please log in to MediAI to view your appointment details.",
+          "",
+          "Regards,",
+          "MediAI Team",
+        ].join("\n"),
+      });
+    } else {
+      console.warn(
+        "Appointment email skipped: patient email address not found.",
+      );
+    }
+  } catch (error) {
+    // Email-related failures must not change the successful API response.
+    console.error("Failed to process appointment status email:", error.message);
+  }
+
   return res.status(200).json({
     success: true,
     message:
@@ -434,7 +466,6 @@ const respondToAppointmentRequest = asyncHandler(async (req, res) => {
     data: appointment,
   });
 });
-
 
 const getPatientAppointments = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10, status } = req.query;
@@ -498,7 +529,6 @@ const getPatientAppointments = asyncHandler(async (req, res) => {
     },
   });
 });
-
 
 const cancelAppointment = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
@@ -571,7 +601,7 @@ const cancelAppointment = asyncHandler(async (req, res) => {
 
       if (!currentAppointment) {
         const error = new Error(
-          "Appointment is no longer eligible for cancellation"
+          "Appointment is no longer eligible for cancellation",
         );
         error.statusCode = 409;
         throw error;
@@ -582,7 +612,7 @@ const cancelAppointment = asyncHandler(async (req, res) => {
         {
           appointmentId: currentAppointment._id,
         },
-        { session }
+        { session },
       );
 
       // Cancel the appointment.
@@ -596,6 +626,52 @@ const cancelAppointment = asyncHandler(async (req, res) => {
 
       cancelledAppointment = currentAppointment.toObject();
     });
+
+    // Notify the doctor after the cancellation transaction commits.
+    try {
+      const doctor = await User.findById(cancelledAppointment.doctorId).select(
+        "name email",
+      );
+
+      if (doctor?.email) {
+        const appointmentDate = new Date(
+          cancelledAppointment.appointmentDate,
+        ).toLocaleString("en-IN", {
+          timeZone: "Asia/Kolkata",
+          dateStyle: "medium",
+          timeStyle: "short",
+        });
+
+        await sendEmail({
+          to: doctor.email,
+          subject: "MediAI: Appointment Cancelled",
+          text: [
+            `Hello Dr. ${doctor.name || ""},`,
+            "",
+            "A patient has cancelled an appointment.",
+            "",
+            `Appointment date and time: ${appointmentDate} (IST)`,
+            cancelledAppointment.cancellationReason
+              ? `Cancellation reason: ${cancelledAppointment.cancellationReason}`
+              : "No cancellation reason was provided.",
+            "",
+            "Please log in to MediAI to view your appointment details.",
+            "",
+            "Regards,",
+            "MediAI Team",
+          ].join("\n"),
+        });
+      } else {
+        console.warn(
+          "Cancellation email skipped: doctor email address not found.",
+        );
+      }
+    } catch (error) {
+      console.error(
+        "Failed to send appointment cancellation email:",
+        error.message,
+      );
+    }
 
     return res.status(200).json({
       success: true,
@@ -615,7 +691,6 @@ const cancelAppointment = asyncHandler(async (req, res) => {
     await session.endSession();
   }
 });
-
 
 const updateAppointmentOutcome = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
@@ -792,7 +867,6 @@ const getDoctorAppointments = asyncHandler(async (req, res) => {
   });
 });
 
-
 const requestAppointmentReschedule = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
   const { newAppointmentDate, durationMinutes, reason } = req.body;
@@ -840,8 +914,7 @@ const requestAppointmentReschedule = asyncHandler(async (req, res) => {
   }
 
   // Validate duration.
-  const duration =
-    durationMinutes === undefined ? 30 : Number(durationMinutes);
+  const duration = durationMinutes === undefined ? 30 : Number(durationMinutes);
 
   if (
     !Number.isInteger(duration) ||
@@ -851,8 +924,7 @@ const requestAppointmentReschedule = asyncHandler(async (req, res) => {
   ) {
     return res.status(400).json({
       success: false,
-      message:
-        "Duration must be a multiple of five between 5 and 240 minutes",
+      message: "Duration must be a multiple of five between 5 and 240 minutes",
     });
   }
 
@@ -899,9 +971,7 @@ const requestAppointmentReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  const endTime = new Date(
-    startTime.getTime() + duration * 60 * 1000
-  );
+  const endTime = new Date(startTime.getTime() + duration * 60 * 1000);
 
   // Check for overlapping confirmed appointments.
   const conflictingAppointment = await Appointment.findOne({
@@ -938,14 +1008,57 @@ const requestAppointmentReschedule = asyncHandler(async (req, res) => {
 
   await appointment.save();
 
+  // Notify the doctor after the rescheduling request is saved.
+  try {
+    const doctorProfile = await Doctor.findById(appointment.doctorId).select(
+      "userId",
+    );
+
+    const doctorUser = doctorProfile
+      ? await User.findById(doctorProfile.userId).select("name email")
+      : null;
+
+    if (doctorUser?.email) {
+      const formatDate = (date) =>
+        new Date(date).toLocaleString("en-IN", {
+          timeZone: "Asia/Kolkata",
+          dateStyle: "medium",
+          timeStyle: "short",
+        });
+
+      await sendEmail({
+        to: doctorUser.email,
+        subject: "MediAI: Appointment Rescheduling Request",
+        text: [
+          `Hello Dr. ${doctorUser.name || ""},`,
+          "",
+          "A patient has requested to reschedule an appointment.",
+          "",
+          `Current appointment time: ${formatDate(appointment.appointmentDate)} (IST)`,
+          `Requested new time: ${formatDate(appointment.rescheduleRequest.requestedDate)} (IST)`,
+          `Reason: ${appointment.rescheduleRequest.reason || "Not provided"}`,
+          "",
+          "Please log in to MediAI to review the request.",
+          "",
+          "Regards,",
+          "MediAI Team",
+        ].join("\n"),
+      });
+    } else {
+      console.warn(
+        "Rescheduling email skipped: doctor email address not found.",
+      );
+    }
+  } catch (error) {
+    console.error("Failed to send rescheduling request email:", error.message);
+  }
+
   return res.status(200).json({
     success: true,
     message: "Rescheduling request submitted successfully",
     data: appointment,
   });
 });
-
-
 
 const respondToRescheduleRequest = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
@@ -994,9 +1107,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
   }
 
   // Verify doctor account is active.
-  const doctorUser = await User.findById(req.user._id).select(
-    "accountStatus"
-  );
+  const doctorUser = await User.findById(req.user._id).select("accountStatus");
 
   if (!doctorUser || doctorUser.accountStatus !== "ACTIVE") {
     return res.status(403).json({
@@ -1079,7 +1190,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
 
         if (!currentAppointment) {
           const error = new Error(
-            "Appointment or rescheduling request is no longer eligible"
+            "Appointment or rescheduling request is no longer eligible",
           );
           error.statusCode = 409;
           throw error;
@@ -1094,7 +1205,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
           currentRequest.requestedEnd <= currentRequest.requestedDate
         ) {
           const error = new Error(
-            "The requested appointment time is no longer valid"
+            "The requested appointment time is no longer valid",
           );
           error.statusCode = 400;
           throw error;
@@ -1112,9 +1223,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
           .session(session);
 
         if (conflictingAppointment) {
-          const error = new Error(
-            "The requested time is no longer available"
-          );
+          const error = new Error("The requested time is no longer available");
           error.statusCode = 409;
           throw error;
         }
@@ -1122,13 +1231,13 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
         // Generate slots before modifying the existing reservations.
         const newSlots = generateAppointmentSlots(
           currentRequest.requestedDate,
-          currentRequest.requestedEnd
+          currentRequest.requestedEnd,
         );
 
         // Remove the old reservations.
         await AppointmentSlot.deleteMany(
           { appointmentId: currentAppointment._id },
-          { session }
+          { session },
         );
 
         // Reserve the new slots. The unique index prevents collisions.
@@ -1138,7 +1247,7 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
             appointmentId: currentAppointment._id,
             slotStart,
           })),
-          { session, ordered: true }
+          { session, ordered: true },
         );
 
         // Update the appointment's scheduled time.
@@ -1161,6 +1270,49 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
 
         updatedAppointment = currentAppointment.toObject();
       });
+
+      // Notify the patient after the rescheduling transaction commits.
+      try {
+        const patient = await User.findById(
+          updatedAppointment.patientId,
+        ).select("name email");
+
+        if (patient?.email) {
+          const appointmentDate = new Date(
+            updatedAppointment.appointmentDate,
+          ).toLocaleString("en-IN", {
+            timeZone: "Asia/Kolkata",
+            dateStyle: "medium",
+            timeStyle: "short",
+          });
+
+          await sendEmail({
+            to: patient.email,
+            subject: "MediAI: Rescheduling Request Accepted",
+            text: [
+              `Hello ${patient.name || "Patient"},`,
+              "",
+              "Your doctor has accepted your appointment rescheduling request.",
+              "",
+              `Your new appointment time: ${appointmentDate} (IST)`,
+              "",
+              "Please log in to MediAI to view your appointment details.",
+              "",
+              "Regards,",
+              "MediAI Team",
+            ].join("\n"),
+          });
+        } else {
+          console.warn(
+            "Rescheduling acceptance email skipped: patient email not found.",
+          );
+        }
+      } catch (error) {
+        console.error(
+          "Failed to send rescheduling acceptance email:",
+          error.message,
+        );
+      }
 
       return res.status(200).json({
         success: true,
@@ -1197,14 +1349,56 @@ const respondToRescheduleRequest = asyncHandler(async (req, res) => {
 
   await appointment.save();
 
+  // Notify the patient after the rejection is saved.
+  try {
+    const patient = await User.findById(appointment.patientId).select(
+      "name email",
+    );
+
+    if (patient?.email) {
+      const originalAppointmentDate = new Date(
+        appointment.appointmentDate,
+      ).toLocaleString("en-IN", {
+        timeZone: "Asia/Kolkata",
+        dateStyle: "medium",
+        timeStyle: "short",
+      });
+
+      await sendEmail({
+        to: patient.email,
+        subject: "MediAI: Rescheduling Request Rejected",
+        text: [
+          `Hello ${patient.name || "Patient"},`,
+          "",
+          "Your doctor has rejected your appointment rescheduling request.",
+          "",
+          `Your existing appointment time remains: ${originalAppointmentDate} (IST)`,
+          `Reason: ${appointment.rescheduleRequest.rejectionReason || "Not provided"}`,
+          "",
+          "Please log in to MediAI to view your appointment details.",
+          "",
+          "Regards,",
+          "MediAI Team",
+        ].join("\n"),
+      });
+    } else {
+      console.warn(
+        "Rescheduling rejection email skipped: patient email not found.",
+      );
+    }
+  } catch (error) {
+    console.error(
+      "Failed to send rescheduling rejection email:",
+      error.message,
+    );
+  }
+
   return res.status(200).json({
     success: true,
     message: "Rescheduling request rejected successfully",
     data: appointment,
   });
 });
-
-
 
 const requestDoctorReschedule = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
@@ -1228,10 +1422,7 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
 
   const startTime = new Date(newAppointmentDate);
 
-  if (
-    Number.isNaN(startTime.getTime()) ||
-    startTime <= new Date()
-  ) {
+  if (Number.isNaN(startTime.getTime()) || startTime <= new Date()) {
     return res.status(400).json({
       success: false,
       message: "A valid future appointment date is required",
@@ -1317,8 +1508,7 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
   ) {
     return res.status(400).json({
       success: false,
-      message:
-        "Duration must be a multiple of five between 5 and 240 minutes",
+      message: "Duration must be a multiple of five between 5 and 240 minutes",
     });
   }
 
@@ -1333,9 +1523,7 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
     });
   }
 
-  const endTime = new Date(
-    startTime.getTime() + duration * 60 * 1000
-  );
+  const endTime = new Date(startTime.getTime() + duration * 60 * 1000);
 
   // Check for conflicts with other confirmed/scheduled appointments.
   const conflictingAppointment = await Appointment.findOne({
@@ -1371,13 +1559,56 @@ const requestDoctorReschedule = asyncHandler(async (req, res) => {
 
   await appointment.save();
 
+  // Notify the patient after the doctor's rescheduling request is saved.
+  try {
+    const patient = await User.findById(appointment.patientId).select(
+      "name email",
+    );
+
+    if (patient?.email) {
+      const formatDate = (date) =>
+        new Date(date).toLocaleString("en-IN", {
+          timeZone: "Asia/Kolkata",
+          dateStyle: "medium",
+          timeStyle: "short",
+        });
+
+      await sendEmail({
+        to: patient.email,
+        subject: "MediAI: Doctor Requested Appointment Rescheduling",
+        text: [
+          `Hello ${patient.name || "Patient"},`,
+          "",
+          "Your doctor has requested to reschedule your appointment.",
+          "",
+          `Current appointment time: ${formatDate(appointment.appointmentDate)} (IST)`,
+          `Proposed new time: ${formatDate(appointment.rescheduleRequest.requestedDate)} (IST)`,
+          `Reason: ${appointment.rescheduleRequest.reason || "Not provided"}`,
+          "",
+          "Please log in to MediAI to accept or reject the proposed time.",
+          "",
+          "Regards,",
+          "MediAI Team",
+        ].join("\n"),
+      });
+    } else {
+      console.warn(
+        "Doctor rescheduling email skipped: patient email address not found.",
+      );
+    }
+  } catch (error) {
+    console.error(
+      "Failed to send doctor rescheduling request email:",
+      error.message,
+    );
+  }
+
   return res.status(200).json({
     success: true,
     message: "Rescheduling request sent to the patient successfully",
     data: appointment,
   });
 });
-
 
 const getPendingRescheduleRequests = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10 } = req.query;
@@ -1442,7 +1673,6 @@ const getPendingRescheduleRequests = asyncHandler(async (req, res) => {
     },
   });
 });
-
 
 const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
   const { appointmentId } = req.params;
@@ -1561,7 +1791,7 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
 
         if (!currentAppointment) {
           const error = new Error(
-            "Appointment or rescheduling request is no longer eligible"
+            "Appointment or rescheduling request is no longer eligible",
           );
           error.statusCode = 409;
           throw error;
@@ -1577,7 +1807,7 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
           currentRequest.requestedEnd <= currentRequest.requestedDate
         ) {
           const error = new Error(
-            "The requested appointment time is no longer valid"
+            "The requested appointment time is no longer valid",
           );
           error.statusCode = 400;
           throw error;
@@ -1595,9 +1825,7 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
           .session(session);
 
         if (conflictingAppointment) {
-          const error = new Error(
-            "The requested time is no longer available"
-          );
+          const error = new Error("The requested time is no longer available");
           error.statusCode = 409;
           throw error;
         }
@@ -1605,13 +1833,13 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
         // Generate the proposed time slots.
         const newSlots = generateAppointmentSlots(
           currentRequest.requestedDate,
-          currentRequest.requestedEnd
+          currentRequest.requestedEnd,
         );
 
         // Release the old reservations.
         await AppointmentSlot.deleteMany(
           { appointmentId: currentAppointment._id },
-          { session }
+          { session },
         );
 
         // Reserve the new slots.
@@ -1625,7 +1853,7 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
           {
             session,
             ordered: true,
-          }
+          },
         );
 
         // Apply the new appointment time.
@@ -1648,6 +1876,53 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
 
         updatedAppointment = currentAppointment.toObject();
       });
+
+      // Notify the doctor after the rescheduling transaction commits.
+      try {
+        const doctorProfile = await Doctor.findById(
+          updatedAppointment.doctorId,
+        ).select("userId");
+
+        const doctorUser = doctorProfile
+          ? await User.findById(doctorProfile.userId).select("name email")
+          : null;
+
+        if (doctorUser?.email) {
+          const appointmentDate = new Date(
+            updatedAppointment.appointmentDate,
+          ).toLocaleString("en-IN", {
+            timeZone: "Asia/Kolkata",
+            dateStyle: "medium",
+            timeStyle: "short",
+          });
+
+          await sendEmail({
+            to: doctorUser.email,
+            subject: "MediAI: Patient Accepted Rescheduling",
+            text: [
+              `Hello Dr. ${doctorUser.name || ""},`,
+              "",
+              "The patient has accepted your proposed appointment time.",
+              "",
+              `Confirmed appointment time: ${appointmentDate} (IST)`,
+              "",
+              "Please log in to MediAI to view the appointment details.",
+              "",
+              "Regards,",
+              "MediAI Team",
+            ].join("\n"),
+          });
+        } else {
+          console.warn(
+            "Doctor notification skipped: doctor email address not found.",
+          );
+        }
+      } catch (error) {
+        console.error(
+          "Failed to send rescheduling acceptance email to doctor:",
+          error.message,
+        );
+      }
 
       return res.status(200).json({
         success: true,
@@ -1684,13 +1959,59 @@ const respondToDoctorRescheduleRequest = asyncHandler(async (req, res) => {
 
   await appointment.save();
 
+  
+  // Notify the doctor after the rejection is saved.
+  try {
+    const doctorProfile = await Doctor.findById(
+      appointment.doctorId
+    ).select("userId");
+
+    const doctorUser = doctorProfile
+      ? await User.findById(doctorProfile.userId).select("name email")
+      : null;
+
+    if (doctorUser?.email) {
+      await sendEmail({
+        to: doctorUser.email,
+        subject: "MediAI: Patient Rejected Rescheduling",
+        text: [
+          `Hello Dr. ${doctorUser.name || ""},`,
+          "",
+          "The patient has rejected your proposed appointment time.",
+          "",
+          `Existing appointment time remains: ${new Date(
+            appointment.appointmentDate
+          ).toLocaleString("en-IN", {
+            timeZone: "Asia/Kolkata",
+            dateStyle: "medium",
+            timeStyle: "short",
+          })} (IST)`,
+          `Rejection reason: ${appointment.rescheduleRequest.rejectionReason || "Not provided"}`,
+          "",
+          "Please log in to MediAI to view the appointment details.",
+          "",
+          "Regards,",
+          "MediAI Team",
+        ].join("\n"),
+      });
+    } else {
+      console.warn(
+        "Doctor notification skipped: doctor email address not found."
+      );
+    }
+  } catch (error) {
+    console.error(
+      "Failed to send rescheduling rejection email to doctor:",
+      error.message
+    );
+  }
+
   return res.status(200).json({
     success: true,
     message: "Doctor's rescheduling request rejected successfully",
     data: appointment,
   });
 });
-
 
 const getPendingDoctorRescheduleRequests = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10 } = req.query;
