@@ -20,6 +20,7 @@ export default function RegisterPatientPage() {
     setForm((prev) => ({ ...prev, [event.target.name]: event.target.value }));
   };
 
+  
   const onSubmit = async (event) => {
     event.preventDefault();
     setError('');
